@@ -14,70 +14,265 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      deployments: write
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: true
+    
     steps:
+      # ========== 1. 代码检出 ==========
       - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Node.js
-        uses: actions/setup-node@v6
+        uses: actions/checkout@v4
         with:
-          node-version: 24
+          fetch-depth: 0
 
-      - uses: pnpm/action-setup@v5
-        name: Install pnpm
-        id: pnpm-install
-        with:
-          version: 10
-          run_install: false
-
-      - name: Deploy Backend for ${{ github.ref_name }}
+      # ========== 2. 环境验证 ==========
+      - name: Validate Required Secrets
         run: |
-          export use_worker_assets=${{ secrets.USE_WORKER_ASSETS }}
-          export use_worker_assets_with_telegram=${{ secrets.USE_WORKER_ASSETS_WITH_TELEGRAM }}
-          
-          if [ -n "$use_worker_assets" ]; then
-            cd frontend/
-            pnpm install --no-frozen-lockfile
-            if [ -n "$use_worker_assets_with_telegram" ]; then
-              echo "Building with telegram pages"
-              pnpm build:telegram:pages
-            else
-              echo "Building with normal pages"
-              pnpm build:pages
+          echo "🔍 Validating required secrets..."
+          REQUIRED_SECRETS=("CLOUDFLARE_ACCOUNT_ID" "CLOUDFLARE_API_TOKEN" "BACKEND_TOML")
+          for secret in "${REQUIRED_SECRETS[@]}"; do
+            if [ -z "${!secret}" ]; then
+              echo "❌ $secret is not set in GitHub Secrets"
+              exit 1
             fi
-            cd ..
-          fi
-
-          export debug_mode=${{ secrets.DEBUG_MODE }}
-          export use_mail_wasm_parser=${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
-          
-          cd worker/
-          # ✅ 修复核心：使用环境变量写入，避免 Shell 解析特殊字符
-          printf '%s\n' "$WRANGLER_TOML_CONTENT" > wrangler.toml
-          
-          pnpm install --no-frozen-lockfile
-
-          if [ -n "$use_mail_wasm_parser" ]; then
-            echo "Using mail-parser-wasm-worker"
-            pnpm add mail-parser-wasm-worker
-            git apply ../.github/config/mail-parser-wasm-worker.patch
-            echo "Applied mail-parser-wasm-worker patch"
-          fi
-
-          if [ "$debug_mode" = "true" ]; then
-            pnpm run deploy
-          else
-            if pnpm run deploy >/dev/null 2>&1; then
-              echo "Deploy succeeded"
-            else
-              code=$?
-              echo "Command failed with exit code $code"
-              exit "$code"
-            fi
-          fi
-          echo "Deployed for tag ${{ github.ref_name }}"
+          done
+          echo "✅ All required secrets are set"
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          # ✅ 将 secret 映射到环境变量中
+          BACKEND_TOML: ${{ secrets.BACKEND_TOML }}
+
+      # ========== 3. 设置 Node.js ==========
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          check-latest: false
+
+      # ========== 4. 设置 pnpm ==========
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      # ========== 5. 缓存依赖 ==========
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            worker/node_modules
+            frontend/node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-node-modules-
+
+      # ========== 6. 构建前端（可选） ==========
+      - name: Build Frontend Assets
+        if: secrets.USE_WORKER_ASSETS != ''
+        run: |
+          echo "🏗️ Building frontend assets..."
+          cd frontend/
+          pnpm install --frozen-lockfile
+          
+          if [ -n "$USE_WORKER_ASSETS_WITH_TELEGRAM" ]; then
+            echo "📱 Building with Telegram pages support"
+            pnpm build:telegram:pages
+          else
+            echo "📱 Building with normal pages support"
+            pnpm build:pages
+          fi
+          
+          # 验证构建产物
+          if [ ! -d "dist" ] && [ ! -d "build" ]; then
+            echo "❌ Frontend build failed - no output directory found"
+            exit 1
+          fi
+          
+          echo "✅ Frontend build completed"
+          cd ..
+        env:
+          USE_WORKER_ASSETS_WITH_TELEGRAM: ${{ secrets.USE_WORKER_ASSETS_WITH_TELEGRAM }}
+
+      # ========== 7. 配置 Worker ==========
+      - name: Configure Worker
+        working-directory: worker
+        run: |
+          echo "⚙️ Configuring worker..."
+          
+          # 写入 wrangler.toml
+          if [ -z "$WRANGLER_TOML_CONTENT" ]; then
+            echo "❌ BACKEND_TOML secret is empty"
+            exit 1
+          fi
+          
+          printf '%s\n' "$WRANGLER_TOML_CONTENT" > wrangler.toml
+          
+          # 验证配置文件
+          if [ ! -s "wrangler.toml" ]; then
+            echo "❌ Failed to create wrangler.toml"
+            exit 1
+          fi
+          
+          echo "📄 wrangler.toml content preview:"
+          head -n 10 wrangler.toml
+          echo "..."
+          
+          # 提取 worker 名称用于后续通知
+          WORKER_NAME=$(grep -E "^name =" wrangler.toml | sed 's/name = "\(.*\)"/\1/')
+          if [ -n "$WORKER_NAME" ]; then
+            echo "WORKER_NAME=$WORKER_NAME" >> $GITHUB_ENV
+            echo "✅ Worker name: $WORKER_NAME"
+          else
+            echo "⚠️  Could not extract worker name from wrangler.toml"
+          fi
+        env:
           WRANGLER_TOML_CONTENT: ${{ secrets.BACKEND_TOML }}
+
+      # ========== 8. 安装 Worker 依赖 ==========
+      - name: Install Worker Dependencies
+        working-directory: worker
+        run: |
+          echo "📦 Installing worker dependencies..."
+          pnpm install --frozen-lockfile
+          echo "✅ Dependencies installed"
+
+      # ========== 9. 应用 WASM 补丁（可选） ==========
+      - name: Apply WASM Parser Patch
+        if: secrets.BACKEND_USE_MAIL_WASM_PARSER != ''
+        working-directory: worker
+        run: |
+          echo "🧩 Applying mail-parser-wasm-worker patch..."
+          pnpm add mail-parser-wasm-worker
+          
+          if [ -f "../.github/config/mail-parser-wasm-worker.patch" ]; then
+            git apply ../.github/config/mail-parser-wasm-worker.patch
+            echo "✅ Patch applied successfully"
+          else
+            echo "⚠️  Patch file not found, continuing..."
+          fi
+
+      # ========== 10. 执行部署 ==========
+      - name: Deploy to Cloudflare Workers
+        id: deploy
+        working-directory: worker
+        run: |
+          echo "🚀 Deploying to Cloudflare Workers..."
+          echo "🔧 Debug mode: $DEBUG_MODE"
+          
+          # 创建部署日志文件
+          DEPLOY_LOG="deploy-$(date +%Y%m%d-%H%M%S).log"
+          
+          # 执行部署
+          if [ "$DEBUG_MODE" = "true" ]; then
+            echo "📋 Running in debug mode with full output..."
+            if pnpm run deploy 2>&1 | tee "$DEPLOY_LOG"; then
+              DEPLOY_SUCCESS=true
+            else
+              DEPLOY_SUCCESS=false
+            fi
+          else
+            echo "📋 Running in production mode..."
+            # 保存完整输出到日志，同时显示进度
+            if pnpm run deploy 2>&1 | tee "$DEPLOY_LOG"; then
+              DEPLOY_SUCCESS=true
+            else
+              DEPLOY_SUCCESS=false
+            fi
+          fi
+          
+          # 设置部署结果
+          if [ "$DEPLOY_SUCCESS" = true ]; then
+            echo "✅ Deployment successful!"
+            echo "deploy_status=success" >> $GITHUB_OUTPUT
+            echo "deploy_log=$DEPLOY_LOG" >> $GITHUB_OUTPUT
+          else
+            EXIT_CODE=$?
+            echo "❌ Deployment failed with exit code: $EXIT_CODE"
+            echo "deploy_status=failed" >> $GITHUB_OUTPUT
+            echo "deploy_log=$DEPLOY_LOG" >> $GITHUB_OUTPUT
+            echo "deploy_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+            exit $EXIT_CODE
+          fi
+          
+          # 提取部署 URL
+          if [ -f "$DEPLOY_LOG" ]; then
+            DEPLOY_URL=$(grep -o "https://[^ ]*\.workers\.dev" "$DEPLOY_LOG" | head -n 1)
+            if [ -n "$DEPLOY_URL" ]; then
+              echo "deploy_url=$DEPLOY_URL" >> $GITHUB_OUTPUT
+              echo "🌐 Deployment URL: $DEPLOY_URL"
+            fi
+          fi
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DEBUG_MODE: ${{ secrets.DEBUG_MODE }}
+
+      # ========== 11. 上传部署日志 ==========
+      - name: Upload Deployment Logs
+        if: always()  # 即使失败也上传日志
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-logs-${{ github.run_id }}
+          path: |
+            worker/deploy-*.log
+            worker/wrangler.toml
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ========== 12. 创建部署状态 ==========
+      - name: Update Deployment Status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.deploy.outputs.deploy_status }}';
+            const deployUrl = '${{ steps.deploy.outputs.deploy_url }}';
+            const ref = '${{ github.ref_name }}';
+            
+            // 创建部署状态
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: context.payload.deployment?.id || 0,
+              state: status === 'success' ? 'success' : 'failure',
+              environment: 'production',
+              environment_url: deployUrl || undefined,
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: `Deployment ${status} for ${ref}`
+            });
+
+      # ========== 13. 发送通知（可选） ==========
+      - name: Send Notification
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "🚀 *Deployment Status*\nRepository: ${{ github.repository }}\nRef: ${{ github.ref_name }}\nStatus: ${{ steps.deploy.outputs.deploy_status == 'success' && '✅ Success' || '❌ Failed' }}\nURL: ${{ steps.deploy.outputs.deploy_url || 'N/A' }}\nLogs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
+      # ========== 14. 清理（可选） ==========
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "🧹 Cleaning up temporary files..."
+          find . -name "*.log" -mtime +1 -delete 2>/dev/null || true
+          echo "✅ Cleanup completed"
