@@ -14,7 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      deployments: write
     concurrency:
       group: deploy-${{ github.ref }}
       cancel-in-progress: true
@@ -84,7 +83,6 @@ jobs:
 
       # ========== 6. 构建前端（可选） ==========
       - name: Build Frontend Assets
-        id: frontend-build
         run: |
           echo "🏗️ Building frontend assets..."
           
@@ -141,7 +139,7 @@ jobs:
           head -n 10 wrangler.toml
           echo "..."
           
-          # 提取 worker 名称用于后续通知
+          # 提取 worker 名称
           WORKER_NAME=$(grep -E "^name =" wrangler.toml | sed 's/name = "\(.*\)"/\1/')
           if [ -n "$WORKER_NAME" ]; then
             echo "WORKER_NAME=$WORKER_NAME" >> $GITHUB_ENV
@@ -152,26 +150,41 @@ jobs:
         env:
           WRANGLER_TOML_CONTENT: ${{ secrets.BACKEND_TOML }}
 
-      # ========== 8. 安装 Worker 依赖 ==========
+      # ========== 8. 检查 WASM 补丁状态 ==========
+      - name: Check WASM Patch Status
+        id: wasm-check
+        run: |
+          if [ -n "$BACKEND_USE_MAIL_WASM_PARSER" ]; then
+            echo "has_wasm_patch=true" >> $GITHUB_OUTPUT
+            echo "🧩 WASM patch will be applied"
+          else
+            echo "has_wasm_patch=false" >> $GITHUB_OUTPUT
+            echo "⏭️ No WASM patch needed"
+          fi
+        env:
+          BACKEND_USE_MAIL_WASM_PARSER: ${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
+
+      # ========== 9. 安装 Worker 依赖 ==========
       - name: Install Worker Dependencies
         working-directory: worker
         run: |
           echo "📦 Installing worker dependencies..."
-          pnpm install --frozen-lockfile
-          echo "✅ Dependencies installed"
-
-      # ========== 9. 应用 WASM 补丁（可选） ==========
-      - name: Apply WASM Parser Patch
-        run: |
-          echo "🧩 Checking for mail-parser-wasm-worker patch..."
-          
-          # 检查是否需要应用补丁
-          if [ -z "$BACKEND_USE_MAIL_WASM_PARSER" ]; then
-            echo "⏭️ Skipping WASM patch (BACKEND_USE_MAIL_WASM_PARSER not set)"
-            exit 0
+          if [ "$HAS_WASM_PATCH" = "true" ]; then
+            pnpm install --no-frozen-lockfile
+          else
+            pnpm install --frozen-lockfile
           fi
+          echo "✅ Dependencies installed"
+        env:
+          HAS_WASM_PATCH: ${{ steps.wasm-check.outputs.has_wasm_patch }}
+
+      # ========== 10. 应用 WASM 补丁（可选） ==========
+      - name: Apply WASM Parser Patch
+        if: steps.wasm-check.outputs.has_wasm_patch == 'true'
+        working-directory: worker
+        run: |
+          echo "🧩 Applying mail-parser-wasm-worker patch..."
           
-          cd worker/
           echo "📦 Adding mail-parser-wasm-worker..."
           pnpm add mail-parser-wasm-worker
           
@@ -181,11 +194,12 @@ jobs:
           else
             echo "⚠️  Patch file not found, continuing..."
           fi
-          cd ..
-        env:
-          BACKEND_USE_MAIL_WASM_PARSER: ${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
+          
+          echo "🔄 Updating lockfile with patched dependencies..."
+          pnpm install --no-frozen-lockfile
+          echo "✅ Lockfile updated"
 
-      # ========== 10. 执行部署 ==========
+      # ========== 11. 执行部署 ==========
       - name: Deploy to Cloudflare Workers
         id: deploy
         working-directory: worker
@@ -195,6 +209,12 @@ jobs:
           
           # 创建部署日志文件
           DEPLOY_LOG="deploy-$(date +%Y%m%d-%H%M%S).log"
+          
+          # 如果有 WASM 补丁，确保依赖是最新的
+          if [ "$HAS_WASM_PATCH" = "true" ]; then
+            echo "📦 Ensuring patched dependencies are installed..."
+            pnpm install --no-frozen-lockfile
+          fi
           
           # 执行部署
           if [ "$DEBUG_MODE" = "true" ]; then
@@ -206,7 +226,6 @@ jobs:
             fi
           else
             echo "📋 Running in production mode..."
-            # 保存完整输出到日志，同时显示进度
             if pnpm run deploy 2>&1 | tee "$DEPLOY_LOG"; then
               DEPLOY_SUCCESS=true
             else
@@ -240,46 +259,55 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           DEBUG_MODE: ${{ secrets.DEBUG_MODE }}
+          HAS_WASM_PATCH: ${{ steps.wasm-check.outputs.has_wasm_patch }}
 
-      # ========== 11. 上传部署日志 ==========
+      # ========== 12. 上传部署日志 ==========
       - name: Upload Deployment Logs
-        if: always()  # 即使失败也上传日志
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: deployment-logs-${{ github.run_id }}
           path: |
             worker/deploy-*.log
             worker/wrangler.toml
+            worker/pnpm-lock.yaml
           retention-days: 7
           if-no-files-found: ignore
 
-      # ========== 12. 创建部署状态 ==========
-      - name: Update Deployment Status
+      # ========== 13. 记录部署摘要 ==========
+      - name: Deployment Summary
         if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const status = '${{ steps.deploy.outputs.deploy_status }}';
-            const deployUrl = '${{ steps.deploy.outputs.deploy_url }}';
-            const ref = '${{ github.ref_name }}';
-            
-            // 创建部署状态
-            await github.rest.repos.createDeploymentStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              deployment_id: context.payload.deployment?.id || 0,
-              state: status === 'success' ? 'success' : 'failure',
-              environment: 'production',
-              environment_url: deployUrl || undefined,
-              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              description: `Deployment ${status} for ${ref}`
-            });
+        run: |
+          echo "=========================================="
+          echo "📊 Deployment Summary"
+          echo "=========================================="
+          echo "Repository: ${{ github.repository }}"
+          echo "Ref: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Status: ${{ steps.deploy.outputs.deploy_status }}"
+          echo "URL: ${{ steps.deploy.outputs.deploy_url || 'N/A' }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "=========================================="
+          
+          # 写入 GitHub 步骤摘要
+          {
+            echo "## 📊 Deployment Summary"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|------|-----|"
+            echo "| 仓库 | ${{ github.repository }} |"
+            echo "| 引用 | ${{ github.ref_name }} |"
+            echo "| 提交 | ${{ github.sha }} |"
+            echo "| 状态 | ${{ steps.deploy.outputs.deploy_status }} |"
+            echo "| URL | ${{ steps.deploy.outputs.deploy_url || 'N/A' }} |"
+            echo "| 运行 | [View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+          } >> $GITHUB_STEP_SUMMARY
 
-      # ========== 13. 发送通知（可选） ==========
+      # ========== 14. 发送 Slack 通知（可选） ==========
       - name: Send Slack Notification
         if: always()
         run: |
-          # 检查 Slack webhook 是否配置
           if [ -z "$SLACK_WEBHOOK_URL" ]; then
             echo "⏭️ Skipping Slack notification (SLACK_WEBHOOK_URL not set)"
             exit 0
@@ -296,7 +324,6 @@ jobs:
             STATUS_TEXT="Failed"
           fi
           
-          # 使用 curl 发送 Slack 通知
           curl -X POST -H 'Content-type: application/json' \
             --data "{
               \"text\": \"🚀 *Deployment Status*\nRepository: ${{ github.repository }}\nRef: ${{ github.ref_name }}\nStatus: $STATUS_EMOJI $STATUS_TEXT\nURL: ${DEPLOY_URL:-N/A}\nLogs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
@@ -304,11 +331,3 @@ jobs:
             "$SLACK_WEBHOOK_URL"
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-
-      # ========== 14. 清理（可选） ==========
-      - name: Cleanup
-        if: always()
-        run: |
-          echo "🧹 Cleaning up temporary files..."
-          find . -name "*.log" -mtime +1 -delete 2>/dev/null || true
-          echo "✅ Cleanup completed"
