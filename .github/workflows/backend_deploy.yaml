@@ -84,9 +84,16 @@ jobs:
 
       # ========== 6. 构建前端（可选） ==========
       - name: Build Frontend Assets
-        if: secrets.USE_WORKER_ASSETS != ''
+        id: frontend-build
         run: |
           echo "🏗️ Building frontend assets..."
+          
+          # 检查是否需要构建前端
+          if [ -z "$USE_WORKER_ASSETS" ]; then
+            echo "⏭️ Skipping frontend build (USE_WORKER_ASSETS not set)"
+            exit 0
+          fi
+          
           cd frontend/
           pnpm install --frozen-lockfile
           
@@ -107,6 +114,7 @@ jobs:
           echo "✅ Frontend build completed"
           cd ..
         env:
+          USE_WORKER_ASSETS: ${{ secrets.USE_WORKER_ASSETS }}
           USE_WORKER_ASSETS_WITH_TELEGRAM: ${{ secrets.USE_WORKER_ASSETS_WITH_TELEGRAM }}
 
       # ========== 7. 配置 Worker ==========
@@ -154,10 +162,17 @@ jobs:
 
       # ========== 9. 应用 WASM 补丁（可选） ==========
       - name: Apply WASM Parser Patch
-        if: secrets.BACKEND_USE_MAIL_WASM_PARSER != ''
-        working-directory: worker
         run: |
-          echo "🧩 Applying mail-parser-wasm-worker patch..."
+          echo "🧩 Checking for mail-parser-wasm-worker patch..."
+          
+          # 检查是否需要应用补丁
+          if [ -z "$BACKEND_USE_MAIL_WASM_PARSER" ]; then
+            echo "⏭️ Skipping WASM patch (BACKEND_USE_MAIL_WASM_PARSER not set)"
+            exit 0
+          fi
+          
+          cd worker/
+          echo "📦 Adding mail-parser-wasm-worker..."
           pnpm add mail-parser-wasm-worker
           
           if [ -f "../.github/config/mail-parser-wasm-worker.patch" ]; then
@@ -166,6 +181,9 @@ jobs:
           else
             echo "⚠️  Patch file not found, continuing..."
           fi
+          cd ..
+        env:
+          BACKEND_USE_MAIL_WASM_PARSER: ${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
 
       # ========== 10. 执行部署 ==========
       - name: Deploy to Cloudflare Workers
@@ -258,16 +276,34 @@ jobs:
             });
 
       # ========== 13. 发送通知（可选） ==========
-      - name: Send Notification
-        if: always() && secrets.SLACK_WEBHOOK_URL != ''
-        uses: slackapi/slack-github-action@v1.26
-        with:
-          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
-          webhook-type: incoming-webhook
-          payload: |
-            {
-              "text": "🚀 *Deployment Status*\nRepository: ${{ github.repository }}\nRef: ${{ github.ref_name }}\nStatus: ${{ steps.deploy.outputs.deploy_status == 'success' && '✅ Success' || '❌ Failed' }}\nURL: ${{ steps.deploy.outputs.deploy_url || 'N/A' }}\nLogs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            }
+      - name: Send Slack Notification
+        if: always()
+        run: |
+          # 检查 Slack webhook 是否配置
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "⏭️ Skipping Slack notification (SLACK_WEBHOOK_URL not set)"
+            exit 0
+          fi
+          
+          DEPLOY_STATUS="${{ steps.deploy.outputs.deploy_status }}"
+          DEPLOY_URL="${{ steps.deploy.outputs.deploy_url }}"
+          
+          if [ "$DEPLOY_STATUS" = "success" ]; then
+            STATUS_EMOJI="✅"
+            STATUS_TEXT="Success"
+          else
+            STATUS_EMOJI="❌"
+            STATUS_TEXT="Failed"
+          fi
+          
+          # 使用 curl 发送 Slack 通知
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"🚀 *Deployment Status*\nRepository: ${{ github.repository }}\nRef: ${{ github.ref_name }}\nStatus: $STATUS_EMOJI $STATUS_TEXT\nURL: ${DEPLOY_URL:-N/A}\nLogs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }" \
+            "$SLACK_WEBHOOK_URL"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
       # ========== 14. 清理（可选） ==========
       - name: Cleanup
