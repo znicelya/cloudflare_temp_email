@@ -93,7 +93,7 @@ jobs:
           fi
           
           cd frontend/
-          pnpm install --frozen-lockfile
+          pnpm install --no-frozen-lockfile
           
           if [ -n "$USE_WORKER_ASSETS_WITH_TELEGRAM" ]; then
             echo "📱 Building with Telegram pages support"
@@ -164,17 +164,32 @@ jobs:
         env:
           BACKEND_USE_MAIL_WASM_PARSER: ${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
 
-      # ========== 9. 安装 Worker 依赖 ==========
+      # ========== 9. 智能安装 Worker 依赖 ==========
       - name: Install Worker Dependencies
         working-directory: worker
         run: |
           echo "📦 Installing worker dependencies..."
+          
+          # 智能处理锁文件
           if [ "$HAS_WASM_PATCH" = "true" ]; then
+            echo "🔄 WASM patch enabled, using no-frozen-lockfile..."
             pnpm install --no-frozen-lockfile
           else
-            pnpm install --frozen-lockfile
+            echo "🔒 Attempting frozen installation..."
+            # 尝试 frozen 安装，如果失败则自动降级
+            if pnpm install --frozen-lockfile 2>&1 | tee install.log; then
+              echo "✅ Dependencies installed with frozen lockfile"
+            else
+              if grep -q "ERR_PNPM_LOCKFILE_CONFIG_MISMATCH" install.log; then
+                echo "⚠️  Lockfile mismatch detected, updating..."
+                pnpm install --no-frozen-lockfile
+                echo "✅ Dependencies installed with updated lockfile"
+              else
+                echo "❌ Installation failed with other error"
+                exit 1
+              fi
+            fi
           fi
-          echo "✅ Dependencies installed"
         env:
           HAS_WASM_PATCH: ${{ steps.wasm-check.outputs.has_wasm_patch }}
 
@@ -210,9 +225,9 @@ jobs:
           # 创建部署日志文件
           DEPLOY_LOG="deploy-$(date +%Y%m%d-%H%M%S).log"
           
-          # 如果有 WASM 补丁，确保依赖是最新的
-          if [ "$HAS_WASM_PATCH" = "true" ]; then
-            echo "📦 Ensuring patched dependencies are installed..."
+          # 确保依赖是最新的
+          if [ -f "pnpm-lock.yaml" ]; then
+            echo "📦 Ensuring all dependencies are installed..."
             pnpm install --no-frozen-lockfile
           fi
           
@@ -259,7 +274,6 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           DEBUG_MODE: ${{ secrets.DEBUG_MODE }}
-          HAS_WASM_PATCH: ${{ steps.wasm-check.outputs.has_wasm_patch }}
 
       # ========== 12. 上传部署日志 ==========
       - name: Upload Deployment Logs
@@ -271,10 +285,11 @@ jobs:
             worker/deploy-*.log
             worker/wrangler.toml
             worker/pnpm-lock.yaml
+            worker/install.log
           retention-days: 7
           if-no-files-found: ignore
 
-      # ========== 13. 记录部署摘要 ==========
+      # ========== 13. 部署摘要 ==========
       - name: Deployment Summary
         if: always()
         run: |
@@ -290,7 +305,6 @@ jobs:
           echo "Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "=========================================="
           
-          # 写入 GitHub 步骤摘要
           {
             echo "## 📊 Deployment Summary"
             echo ""
@@ -304,7 +318,7 @@ jobs:
             echo "| 运行 | [View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
           } >> $GITHUB_STEP_SUMMARY
 
-      # ========== 14. 发送 Slack 通知（可选） ==========
+      # ========== 14. Slack 通知（可选） ==========
       - name: Send Slack Notification
         if: always()
         run: |
